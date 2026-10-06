@@ -1,0 +1,346 @@
+---
+title: "Volume Changed. Lethality Didn't Follow."
+subtitle: "NYPD Shooting Incident Data, 2006-present"
+author: "Mo"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5)
+library(tidyverse)
+library(lubridate)
+library(scales)
+```
+
+> Note: `install.packages("tidyverse")` is deliberately **not** in this document.
+> Install once from the console; the Rmd only loads libraries so that knitting
+> is fast and side-effect free.
+
+# Step 1: Import
+
+**Source:** NYC Open Data, *NYPD Shooting Incident Data (Historic)*,
+dataset ID `833y-fsy8`.
+
+**The question this report asks:** New York's shooting volume moved
+dramatically over this period. Did the *nature* of those shootings change
+alongside the count — and what, if anything, predicts whether a shooting
+kills someone?
+
+```{r import}
+url_in <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+
+nypd_raw <- read_csv(url_in)
+
+dim(nypd_raw)
+```
+
+The raw file has `r nrow(nypd_raw)` rows and `r ncol(nypd_raw)` columns.
+ 
+glimpse(nypd_raw)
+ 
+# Step 2: Tidy and Transform
+
+## Summary of the raw data
+
+```{r summary-raw} 
+summary(select(nypd_raw, -OCCUR_TIME))
+```
+
+```{r na-raw}
+colSums(is.na(nypd_raw))
+```
+
+## One row is one victim, not one incident
+
+`INCIDENT_KEY` is not unique meaning that when a shooting has more than one
+victim, a row (victim) will be created and incident key repeats. As every count 
+in this report is a **victim**, reporting these as "incidents" would overstate 
+the number of shooting events. Refer to below:
+
+```{r incident-vs-victim}
+tibble(
+  victim_rows      = nrow(nypd_raw),
+  unique_incidents = n_distinct(nypd_raw$INCIDENT_KEY),
+  multi_victim_pct = percent(1 - n_distinct(nypd_raw$INCIDENT_KEY) / nrow(nypd_raw),
+                             accuracy = 0.1)
+)
+```
+
+
+## Missing data and common dirty data caused by data-entry errors
+
+`colSums(is.na())` understates the gaps, because this dataset comes with mixed unknown
+values three different ways: `NA`, string `"UNKNOWN"`, and
+string `"(null)"`. The age fields contains data-entry
+errors, for example `1020`, `224` and `940` that are not reasonable.
+
+```{r inspect-sentinels}
+nypd_raw %>% count(PERP_AGE_GROUP, sort = TRUE)
+nypd_raw %>% count(VIC_AGE_GROUP,  sort = TRUE)
+nypd_raw %>% count(PERP_SEX,       sort = TRUE)
+nypd_raw %>% count(LOCATION_DESC,  sort = TRUE) %>% head(10)
+```
+
+## The Clean Up
+
+Things that I cleaned up to make the dataset more reasonable and analyzable including 
+time of the date without changing the meaning of any rows:
+
+1. Change **`OCCUR_DATE` to a real date**, and a derived `OCCUR_HOUR` so time of day
+   can be analysed numerically.
+2. **Mixed unknown values input unified to `NA`.** `"UNKNOWN"` and `"(null)"` mean the
+   same thing as a blank which should be counted as missing.
+3. **Invalid age values dropped to `NA`.** Keep unreasonable 'noise' out.
+4. **Geographic coordinate columns removed.** This analysis works at borough
+   level, so point coordinates add nothing.
+5. **`LOC_OF_OCCUR_DESC` and `LOC_CLASSFCTN_DESC` removed.** These two
+   columns are empty for the large majority of the record — see the check below. 
+   Keeping them would restrict analysis that used them to recent years only.
+
+```{r late-added-columns}
+nypd_raw %>%
+  mutate(yr = year(mdy(OCCUR_DATE))) %>%
+  group_by(yr) %>%
+  summarise(rows = n(),
+            missing_loc_class = sum(is.na(LOC_CLASSFCTN_DESC)),
+            pct_missing = percent(missing_loc_class / rows)) %>%
+  print(n = Inf)
+```
+
+```{r tidy}
+valid_ages <- c("<18", "18-24", "25-44", "45-64", "65+")
+
+cat_cols <- c("BORO", "PRECINCT", "JURISDICTION_CODE", "LOCATION_DESC",
+              "PERP_SEX", "PERP_RACE", "VIC_SEX", "VIC_RACE")
+
+nypd <- nypd_raw %>%
+  mutate(OCCUR_DATE = mdy(OCCUR_DATE),
+         OCCUR_HOUR = hour(OCCUR_TIME),
+         YEAR       = year(OCCUR_DATE)) %>%
+  # mixed unknown values inputs -> NA
+  mutate(across(where(is.character),
+                ~ if_else(.x %in% c("(null)", "UNKNOWN", "NONE"),
+                          NA_character_, .x))) %>%
+  mutate(across(c(PERP_SEX, VIC_SEX), ~ na_if(.x, "U"))) %>%
+  # invalid age -> NA
+  mutate(PERP_AGE_GROUP = factor(if_else(PERP_AGE_GROUP %in% valid_ages,
+                                         PERP_AGE_GROUP, NA_character_),
+                                 levels = valid_ages),
+         VIC_AGE_GROUP  = factor(if_else(VIC_AGE_GROUP %in% valid_ages,
+                                         VIC_AGE_GROUP, NA_character_),
+                                 levels = valid_ages)) %>%
+  mutate(across(any_of(cat_cols), factor)) %>%
+  select(-any_of(c("X_COORD_CD", "Y_COORD_CD", "Latitude", "Longitude",
+                   "Lon_Lat", "LOC_OF_OCCUR_DESC", "LOC_CLASSFCTN_DESC")))
+```
+
+Age brackets are set as **ordered factor levels**.
+
+## Summary of the cleaned-up data
+
+```{r summary-clean}
+summary(select(nypd, -OCCUR_TIME))
+```
+
+```{r na-clean}
+colSums(is.na(nypd))
+```
+
+## For the missing data
+
+| Column group | Missing | Treatment |
+|---|---|---|
+| Victim fields | Very low | Left as-is; negligible effect |
+| `JURISDICTION_CODE` | 2 rows | Left as-is |
+| `LOCATION_DESC` | High | Not used in the analysis below |
+| Perpetrator fields | ~45% | **Rows kept.** Treated as a finding, not a defect — see Bias |
+
+Rows are **not** dropped. Deleting incomplete or dirty records would drop almost
+half the data and would increase bias.
+
+# Step 3: Visualize and Analyze
+
+## Finding 1: Volume changed drastically and then boroughs diverged
+
+```{r viz-volume}
+by_year_boro <- nypd %>% count(YEAR, BORO)
+
+ggplot(by_year_boro, aes(YEAR, n, color = BORO)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.6) +
+  scale_x_continuous(breaks = seq(2006, 2030, 2)) +
+  labs(title    = "Shooting victims per year by borough",
+       x = NULL, y = "Victims", color = "Borough") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r volume-numbers}
+totals <- nypd %>% count(YEAR, name = "victims")
+
+peak_year   <- totals %>% slice_max(victims, n = 1)
+trough_year <- totals %>% filter(YEAR < 2020) %>% slice_min(victims, n = 1)
+spike_2020  <- totals %>% filter(YEAR %in% c(2019, 2020))
+
+totals %>% print(n = Inf)
+```
+
+Shooting volume fell steadily through the 2010s and hit a low of
+`r trough_year$victims` victims in `r trough_year$YEAR`, then rose radpidly in
+2020 with an increase of
+`r percent(spike_2020$victims[2] / spike_2020$victims[1] - 1, accuracy = 1)`
+in one year. Every borough rose in 2020. 
+
+After the peak:
+
+```{r recovery}
+latest_yr <- max(nypd$YEAR)
+
+recovery <- nypd %>%
+  filter(YEAR %in% c(2019, latest_yr)) %>%
+  mutate(period = if_else(YEAR == 2019, "pre", "latest")) %>%
+  count(BORO, period) %>%
+  pivot_wider(names_from = period, values_from = n) %>%
+  mutate(change_vs_2019 = percent(latest / pre - 1, accuracy = 1)) %>%
+  arrange(desc(latest / pre))
+recovery
+
+# years in which the Bronx recorded more victims than Brooklyn
+nypd %>%
+  filter(BORO %in% c("BRONX", "BROOKLYN")) %>%
+  count(YEAR, BORO) %>%
+  pivot_wider(names_from = BORO, values_from = n) %>%
+  filter(BRONX > BROOKLYN)
+```
+
+By `r latest_yr`, some boroughs were back at or below their 2019 level. 
+The Bronx recorded more shooting victims than Brooklyn in several recent years 
+even with its less dense population.
+
+## Finding 2: Volume and fatality run in opposite directions across the day
+
+```{r viz-hour}
+by_hour <- nypd %>%
+  group_by(OCCUR_HOUR) %>%
+  summarise(victims = n(),
+            deaths  = sum(STATISTICAL_MURDER_FLAG),
+            rate    = deaths / victims)
+
+by_hour %>%
+  select(OCCUR_HOUR, victims, rate) %>%
+  pivot_longer(c(victims, rate)) %>%
+  mutate(name = recode(name,
+                       victims = "Victims (count)",
+                       rate    = "Share fatal")) %>%
+  ggplot(aes(OCCUR_HOUR, value)) +
+  geom_line(linewidth = 0.9, color = "#2F4858") +
+  geom_point(size = 1.6, color = "#2F4858") +
+  facet_wrap(~name, scales = "free_y", ncol = 1) +
+  scale_x_continuous(breaks = seq(0, 23, 3)) +
+  labs(title    = "More shootings during the night. More dealy during the day.",
+       x = "Hour of day", y = NULL,
+       caption  = "Source: NYC Open Data 833y-fsy8") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r hour-numbers}
+by_hour %>% mutate(rate = percent(rate, accuracy = 0.1)) %>% print(n = Inf)
+```
+
+```{r hour-tests}
+hour_cor <- cor.test(by_hour$victims, by_hour$rate)
+hour_cor
+
+band_levels <- c("Late night (00-04)", "Morning (05-11)",
+                 "Afternoon (12-17)", "Evening (18-23)")
+
+nypd <- nypd %>%
+  mutate(TIME_BAND = factor(case_when(
+    OCCUR_HOUR <= 4  ~ band_levels[1],
+    OCCUR_HOUR <= 11 ~ band_levels[2],
+    OCCUR_HOUR <= 17 ~ band_levels[3],
+    TRUE             ~ band_levels[4]), levels = band_levels))
+
+by_band <- nypd %>%
+  group_by(TIME_BAND) %>%
+  summarise(victims = n(),
+            deaths  = sum(STATISTICAL_MURDER_FLAG),
+            rate    = deaths / victims)
+by_band %>% mutate(rate = percent(rate, accuracy = 0.1))
+
+morning_rate <- by_band$rate[by_band$TIME_BAND == "Morning (05-11)"]
+rest_rate <- nypd %>%
+  filter(TIME_BAND != "Morning (05-11)") %>%
+  summarise(r = mean(STATISTICAL_MURDER_FLAG)) %>% pull(r)
+
+morning_test <- with(nypd, chisq.test(table(TIME_BAND == "Morning (05-11)",
+                                            STATISTICAL_MURDER_FLAG)))
+morning_test
+```
+
+Volume peaks late at night: the busiest hour has
+`r round(max(by_hour$victims) / min(by_hour$victims), 1)` times as many victims
+as the quietest. The fatality rate runs the opposite way. The correlation
+between hourly volume and hourly fatality rate is
+`r round(hour_cor$estimate, 2)` (p = `r signif(hour_cor$p.value, 2)`).
+
+Aggregating 05:00 to 11:59, morning shootings are fatal
+`r percent(morning_rate, accuracy = 0.1)` of the time, against
+`r percent(rest_rate, accuracy = 0.1)` for the rest of the day, a ratio of
+`r round(morning_rate / rest_rate, 2)`
+
+This observation make me wonder why. Is it fewer bystanders to help, different kinds of
+shootings, or traffic during traffic peak hours blocking successful rescue? The model
+below tests the last of these.
+
+# Step 4: Bias and Conclusion
+
+**Counts are not rates.** Brooklyn leads every volume chart in this report,
+and Brooklyn is also the most populous borough. Without population
+denominators these charts partly measure borough size.
+
+```{r caveat-population}
+nypd %>%
+  count(BORO, sort = TRUE) %>%
+  mutate(share = percent(n / sum(n), accuracy = 0.1))
+```
+
+Joining NYC population estimates would convert these to per-capita rates and
+could reorder the boroughs substantially. That join is the obvious next step
+and is deliberately left as an open question rather than papered over.
+
+**The outcome variable is not purely about violence.** Whether a victim dies
+depends in part on how quickly they reach ER. `STATISTICAL_MURDER_FLAG`
+therefore blends the severity of the shooting with the quality and proximity
+of emergency medical care — a confound sitting inside the dependent variable
+itself.
+
+**This is police-recorded data.** It captures shootings the NYPD recorded.
+Anything not reported to or recorded by the police is absent by construction,
+and reporting propensity is unlikely to be uniform across neighbourhoods.
+
+
+
+## Conclusion
+
+New York's shooting volume fell by more than half over the 2010s and then
+roughly doubled in 2020. Every borough rose together, but they did not come
+down together: by `r latest_yr` some had returned to their 2019 levels while
+the Bronx and Manhattan remained well above them.
+
+Across the day the relationship is
+not just absent but reversed: lethality peaks in the morning, when shootings
+are rarest. Victim age is the strongest predictor of a fatal outcome.
+
+The practical reading is that "how many shootings happen" and "how many
+shootings kill" are two different questions with two different sets of causes,
+and interventions aimed at one should not be expected to move the other.
+ 
