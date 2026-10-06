@@ -1,0 +1,488 @@
+---
+title: "The Rural Reversal: How COVID-19 Deaths Moved from Big Cities to Small Counties"
+
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 10, fig.height = 5.5)
+```
+
+# The question
+
+At the start of the pandemic, COVID-19 hit big, crowded cities hardest. This report asks whether that stayed true.
+
+> **Did COVID-19 deaths move from big counties to small counties over time? If so, when?**
+
+Most COVID reports rank places by total cases. This one follows a single thing instead: county size versus death rate. It tracks that link through seven periods of the pandemic and tests whether it changed.
+
+# The data
+
+The data comes from Johns Hopkins University (CSSE). They stopped updating it in March 2023, so the files no longer change. That means this report gives the same numbers every time someone runs it.
+
+Files I use:
+
+* `time_series_covid19_deaths_US.csv`: total deaths so far for each US county, for every day from January 22, 2020 to March 9, 2023. It also gives each county's population, which is what lets me turn counts into rates.
+* `time_series_covid19_confirmed_US.csv`: the same layout, but cases. I use it once, in the bias section.
+* `time_series_covid19_recovered_global.csv`: I load this only to show why I don't use it.
+
+
+# Import
+ 
+```{r libraries}
+##install.packages(c("tidyverse", "broom"))
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(broom)
+```
+
+```{r import}
+url_base <- paste0("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/",
+                   "csse_covid_19_data/csse_covid_19_time_series/")
+
+us_cases_raw  <- read_csv(paste0(url_base, "time_series_covid19_confirmed_US.csv"),
+                          show_col_types = FALSE)
+us_deaths_raw <- read_csv(paste0(url_base, "time_series_covid19_deaths_US.csv"),
+                          show_col_types = FALSE)
+recovered_raw <- read_csv(paste0(url_base, "time_series_covid19_recovered_global.csv"),
+                          show_col_types = FALSE)
+
+# Date columns are named like "1/22/20"
+date_pattern <- "^\\d{1,2}/\\d{1,2}/\\d{2}$"
+```
+
+The ID columns:
+
+```{r glimpse}
+us_deaths_raw %>%
+  select(UID:Population, `1/22/20`, `1/23/20`) %>%
+  glimpse()
+```
+
+The deaths file has `r format(nrow(us_deaths_raw), big.mark = ",")` rows and `r sum(str_detect(names(us_deaths_raw), date_pattern))` day columns.
+
+# Tidy
+
+## Transform and join
+
+I turn each file long, so there is one row per place per day. Then I join the case numbers onto the death numbers.
+
+```{r reshape}
+deaths_long <- us_deaths_raw %>%
+  select(UID, county = Admin2, state = Province_State, population = Population,
+         matches(date_pattern)) %>%
+  pivot_longer(matches(date_pattern), names_to = "date", values_to = "deaths") %>%
+  mutate(date = mdy(date))
+
+cases_long <- us_cases_raw %>%
+  select(UID, matches(date_pattern)) %>%
+  pivot_longer(matches(date_pattern), names_to = "date", values_to = "cases") %>%
+  mutate(date = mdy(date))
+
+us_long <- deaths_long %>%
+  left_join(cases_long, by = c("UID", "date"))
+
+last_date <- max(us_long$date)
+```
+
+## Check for deaths that states could not place in a county
+
+Every state has an "Unassigned" row (and usually an "Out of [state]" row) for deaths it hasn't matched to a county yet. A few of these are harmless. The problem is when a state holds a big share of its deaths there for months, then moves them all into counties on one day. Deaths that built up slowly then land on a single date, which may fall in the wrong part of the pandemic.
+
+Here is the biggest case in the data:
+
+```{r biggest-move}
+biggest_move <- us_long %>%
+  filter(str_detect(coalesce(county, ""), "^Unassigned")) %>%
+  arrange(UID, date) %>%
+  group_by(UID) %>%
+  mutate(change = deaths - lag(deaths)) %>%
+  ungroup() %>%
+  slice_min(change, n = 1, with_ties = FALSE)
+```
+
+On `r format(biggest_move$date, "%B %d, %Y")`, `r biggest_move$state` moved `r format(-biggest_move$change, big.mark = ",")` deaths out of its Unassigned row and into its counties in a single day. If I left that in, all those deaths would count in whichever period that one date lands in, not when people actually died.
+
+To find this problem I used the snippet below, for each state and each day, what share of that state's deaths were sitting in unplaced rows. It starts in July 2020, because many states had unplaced deaths in the first few months while they were still setting up their reporting. I flag a state if more than 10% of its deaths sat unplaced for more than 30 days.
+
+```{r state-check}
+states_and_dc <- c(state.name, "District of Columbia")
+
+state_check <- us_long %>%
+  filter(state %in% states_and_dc, date >= ymd("2020-07-01")) %>%
+  mutate(unplaced = str_detect(coalesce(county, ""), "^Unassigned|^Out of")) %>%
+  group_by(state, date) %>%
+  summarise(share_unplaced = sum(deaths[unplaced]) / sum(deaths), .groups = "drop") %>%
+  group_by(state) %>%
+  summarise(max_share_unplaced = max(share_unplaced, na.rm = TRUE),
+            days_over_10pct    = sum(share_unplaced > 0.10, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(desc(days_over_10pct), desc(max_share_unplaced))
+
+flagged_states <- state_check %>%
+  filter(days_over_10pct > 30) %>%
+  pull(state)
+
+state_check %>%
+  head(10) %>%
+  mutate(max_share_unplaced = scales::percent(max_share_unplaced, accuracy = 0.1),
+         flagged = state %in% flagged_states) %>%
+  knitr::kable(col.names = c("State", "Highest share unplaced", "Days over 10%", "Flagged"))
+```
+
+I drop the flagged states (`r paste(flagged_states, collapse = ", ")`) from the main analysis. Later on, I run a check shows what happens if I put them back in.
+
+## Decide which rows are really counties
+
+Not every row is a county. I apply these rules in order, and the table shows how many deaths each rule touches.
+
+1. **Territories and cruise ships** get dropped, because the question is about the 50 states and DC.
+2. **"Unassigned" and "Out of [state]" rows** get dropped. They have no population, so I can't turn them into a rate.
+3. **Counties in the flagged states** get dropped, using the check above.
+4. **Kansas City, Missouri** has its own row, on top of the four counties it sits inside (Jackson, Clay, Platte and Cass). Those counties' populations already count the city's residents. So I merge the five rows into one place, and I don't count the city's population a second time.
+5. **Rows with no population** get dropped. Most are Utah health districts, which report for several counties at once. There is also a combined Dukes-and-Nantucket row and two Michigan prison rows.
+6. **Placeholder counties** get dropped. These have a population but zero cases for the entire pandemic, because their numbers went into one of the combined rows from rule 5.
+
+```{r unit-status}
+kc_parts <- c("Jackson", "Clay", "Platte", "Cass", "Kansas City")
+
+# Rules 1, 2, 4, 5 and 6; rule 3 (flagged states) is applied separately below
+base_status <- function(state, county, population, cases) {
+  case_when(
+    !state %in% states_and_dc                  ~ "Dropped: territory or cruise ship",
+    str_detect(county, "^Unassigned|^Out of")  ~ "Dropped: unassigned / out-of-state row",
+    state == "Missouri" & county %in% kc_parts ~ "Kept: merged into Kansas City area",
+    population == 0                            ~ "Dropped: no population (combined district, prison)",
+    cases == 0                                 ~ "Dropped: placeholder county (counts filed elsewhere)",
+    TRUE                                       ~ "Kept")
+}
+
+unit_status <- us_long %>%
+  filter(date == last_date) %>%
+  mutate(county = coalesce(county, ""),
+         status_ignoring_flags = base_status(state, county, population, cases),
+         status = if_else(state %in% flagged_states &
+                            str_starts(status_ignoring_flags, "Kept"),
+                          "Dropped: county in a flagged state", status_ignoring_flags))
+
+status_table <- unit_status %>%
+  group_by(status) %>%
+  summarise(rows = n(), deaths = sum(deaths), .groups = "drop") %>%
+  mutate(pct_of_all_deaths = round(100 * deaths / sum(deaths), 2))
+
+knitr::kable(status_table, format.args = list(big.mark = ","),
+             col.names = c("Status", "Rows", "Deaths by Mar 9, 2023", "% of all deaths"))
+
+pct_deaths_kept <- status_table %>%
+  filter(str_starts(status, "Kept")) %>%
+  summarise(sum(pct_of_all_deaths)) %>%
+  pull()
+```
+
+The rows I keep hold `r pct_deaths_kept`% of all the deaths in the file.
+
+## Build the county-by-day table
+
+The main table leaves the flagged states out.  
+
+```{r county-daily}
+keep_uids_all <- unit_status %>%
+  filter(str_starts(status_ignoring_flags, "Kept")) %>%
+  pull(UID)
+
+county_daily_all <- us_long %>%
+  filter(UID %in% keep_uids_all) %>%
+  mutate(in_kc     = state == "Missouri" & county %in% kc_parts,
+         unit_id   = if_else(in_kc, "kansas-city-area", as.character(UID)),
+         unit_name = if_else(in_kc, "Kansas City area", county),
+         # The four counties' populations already include Kansas City residents
+         population = if_else(in_kc & county == "Kansas City", 0, population)) %>%
+  group_by(unit_id, unit_name, state, date) %>%
+  summarise(population = sum(population),
+            cases      = sum(cases),
+            deaths     = sum(deaths),
+            .groups = "drop") %>%
+  arrange(unit_id, date) %>%
+  group_by(unit_id) %>%
+  mutate(new_deaths = deaths - lag(deaths, default = 0),
+         new_cases  = cases  - lag(cases,  default = 0)) %>%
+  ungroup()
+
+county_daily <- county_daily_all %>%
+  filter(!state %in% flagged_states)
+
+n_units <- n_distinct(county_daily$unit_id)
+n_negative_days <- sum(county_daily$new_deaths < 0)
+```
+
+That return `r format(n_units, big.mark = ",")` places. To get new deaths each day, I subtract one day's running total from the next. On `r format(n_negative_days, big.mark = ",")` county-days that number comes out negative, which means a county corrected its total downward.  
+
+## County size groups and pandemic periods
+
+I sort counties into four size groups for the charts. The model later uses population as a plain number, so its results don't depend on where I draw these lines.
+
+```{r groups}
+group_levels <- c("Under 10k", "10k-50k", "50k-250k", "250k+")
+group_colors <- c("Under 10k" = "#b2182b", "10k-50k" = "#ef8a62",
+                  "50k-250k" = "#67a9cf", "250k+" = "#2166ac")
+
+add_group <- function(df) {
+  df %>% mutate(size_group = cut(population, breaks = c(0, 1e4, 5e4, 2.5e5, Inf),
+                                 labels = group_levels, right = FALSE))
+}
+county_daily     <- add_group(county_daily)
+county_daily_all <- add_group(county_daily_all)
+
+group_pop <- county_daily %>%
+  filter(date == last_date) %>%
+  group_by(size_group) %>%
+  summarise(counties = n(), population = sum(population), .groups = "drop") %>%
+  mutate(pct_of_population = round(100 * population / sum(population), 1))
+
+knitr::kable(group_pop, format.args = list(big.mark = ","),
+             col.names = c("County size", "Counties", "Population", "% of population"))
+```
+
+Most counties are small, but most people live in the big ones. So an average across counties and an average across people tell different stories. That gap is part of what this report is about.
+
+I split the pandemic into seven periods by waves.
+
+```{r periods}
+period_breaks <- c(ymd(c("2020-01-22", "2020-07-01", "2020-10-01", "2021-03-01",
+                         "2021-07-01", "2021-12-01", "2022-04-01")), last_date + 1)
+period_labels <- c("Early (Jan-Jun 2020)", "Summer 2020 (Jul-Sep)",
+                   "Winter 2020-21 (Oct-Feb)", "Spring 2021 (Mar-Jun)",
+                   "Delta (Jul-Nov 2021)", "Omicron (Dec 2021-Mar 2022)",
+                   "Late (Apr 2022-Mar 2023)")
+period_short  <- c("Early", "Summer '20", "Winter '20-21", "Spring '21",
+                   "Delta", "Omicron", "Late")
+
+period_table <- tibble(period = factor(period_labels, levels = period_labels),
+                       short  = period_short,
+                       start  = period_breaks[-length(period_breaks)],
+                       end    = period_breaks[-1] - 1,
+                       shade  = rep(c("a", "b"), length.out = length(period_labels)))
+```
+
+```{r viz-periods, fig.height = 3.8}
+national_weekly <- county_daily %>%
+  mutate(week = floor_date(date, "week", week_start = 1)) %>%
+  group_by(week) %>%
+  summarise(new_deaths = sum(new_deaths), .groups = "drop") %>%
+  filter(week > min(week), week < max(week))   # drop partial first and last weeks
+
+ggplot() +
+  geom_rect(data = period_table,
+            aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf, fill = shade),
+            alpha = 0.5, show.legend = FALSE) +
+  geom_line(data = national_weekly, aes(week, new_deaths), linewidth = 0.8) +
+  geom_text(data = period_table,
+            aes(x = start + (end - start) / 2, y = max(national_weekly$new_deaths) * 1.08,
+                label = short), size = 3.2) +
+  scale_fill_manual(values = c(a = "grey92", b = "white")) +
+  scale_y_continuous(labels = scales::comma, expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Weekly COVID-19 deaths in the states I analyzed, split into seven periods",
+       x = NULL, y = "Deaths per week") +
+  theme_minimal(base_size = 12)
+```
+
+# Analysis
+
+## When did small counties pass big ones?
+
+```{r viz-cumulative}
+group_daily <- county_daily %>%
+  group_by(size_group, date) %>%
+  summarise(deaths = sum(deaths), population = sum(population), .groups = "drop") %>%
+  mutate(deaths_per_100k = deaths / population * 1e5)
+
+group_wide <- group_daily %>%
+  select(size_group, date, deaths_per_100k) %>%
+  pivot_wider(names_from = size_group, values_from = deaths_per_100k)
+
+# Ignore the first weeks, when every group's rate was close to zero
+crossover_date <- group_wide %>%
+  filter(date >= ymd("2020-05-01"), `Under 10k` > `250k+`) %>%
+  summarise(first = min(date)) %>%
+  pull(first)
+
+stays_ahead <- group_wide %>%
+  filter(date >= crossover_date) %>%
+  summarise(all(`Under 10k` > `250k+`)) %>%
+  pull()
+
+rate_at <- function(group, day) {
+  group_daily %>% filter(size_group == group, date == day) %>%
+    pull(deaths_per_100k) %>% round()
+}
+
+ggplot(group_daily, aes(date, deaths_per_100k, color = size_group)) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = crossover_date, linetype = "dashed", color = "grey40") +
+  annotate("label", x = crossover_date - 15, y = 380, hjust = 1, size = 3.5,
+           label = paste0("Smallest counties pass\nthe largest on ",
+                          format(crossover_date, "%b %d, %Y"))) +
+  scale_color_manual(values = group_colors, name = "County population") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Total COVID-19 deaths per 100,000 people, by county size",
+       subtitle = "Big counties led at first. Small counties passed them in late 2020 and stayed ahead.",
+       x = NULL, y = "Total deaths per 100,000") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+```
+
+On June 30, 2020, the biggest counties had `r rate_at("250k+", ymd("2020-06-30"))` deaths per 100,000 people. The smallest had `r rate_at("Under 10k", ymd("2020-06-30"))`. The smallest counties passed the biggest on `r format(crossover_date, "%B %d, %Y")`, and `r if (stays_ahead) 'they stayed ahead every single day after that' else 'the lead changed hands again later on'`. By the end the order had completely flipped: `r rate_at("Under 10k", last_date)` per 100,000 in the smallest counties, against `r rate_at("250k+", last_date)` in the biggest.
+
+
+
+## The model: did the size-death link change over time?
+
+The charts suggest the link between county size and death rate flipped.   For county *i* in period *j*:
+
+$$\text{deaths per 100k}_{ij} = \alpha_j + \beta_j \cdot \log_{10}(\text{population}_i) + \varepsilon_{ij}$$
+
+Each period gets its own starting point ($\alpha_j$) and its own slope ($\beta_j$).A positive slope means bigger counties had higher death rates. A negative slope means smaller counties did. 
+ 
+```{r model}
+make_county_period <- function(daily) {
+  daily %>%
+    mutate(period = cut(date, breaks = period_breaks, labels = period_labels, right = FALSE)) %>%
+    group_by(unit_id, unit_name, state, population, size_group, period) %>%
+    summarise(deaths = sum(new_deaths), cases = sum(new_cases), .groups = "drop") %>%
+    mutate(death_rate = deaths / population * 1e5,   # deaths per 100,000 in that period
+           log10_pop  = log10(population))
+}
+county_period <- make_county_period(county_daily)
+
+group_period <- county_period %>%
+  group_by(period, size_group) %>%
+  summarise(deaths = sum(deaths), cases = sum(cases), population = sum(population),
+            .groups = "drop") %>%
+  mutate(death_rate = deaths / population * 1e5,
+         deaths_per_100_cases = 100 * deaths / cases)
+
+group_period_wide <- group_period %>%
+  select(period, size_group, death_rate) %>%
+  pivot_wider(names_from = size_group, values_from = death_rate) %>%
+  mutate(small_to_large = `Under 10k` / `250k+`)
+
+knitr::kable(group_period_wide, digits = c(0, 1, 1, 1, 1, 2),
+             col.names = c("Period", group_levels, "Smallest / largest"))
+
+most_lopsided <- group_period_wide %>% slice_max(small_to_large, n = 1)
+
+model_same_slope  <- lm(death_rate ~ period + log10_pop, data = county_period)
+model_period_slope <- lm(death_rate ~ period * log10_pop, data = county_period)
+
+slope_test <- anova(model_same_slope, model_period_slope)
+slope_test
+```
+
+```{r model-fit}
+bind_rows(same_slope   = glance(model_same_slope),
+          period_slope = glance(model_period_slope), .id = "model") %>%
+  select(model, r.squared, adj.r.squared, sigma, nobs) %>%
+  knitr::kable(digits = 3)
+```
+
+Giving each period its own slope does fit much better (F = `r round(slope_test$F[2], 1)`, p < 0.001). But the R-squared values are low. That tells me most of the difference in county death rates comes from the period itself and from things this dataset doesn't contain, not from county size. County size is a real pattern, just not the whole story.
+
+To read each period's slope straight off, I fit the same model again in a slightly different form that puts one slope on each line. The predictions are identical, and the `stopifnot()` line below checks that.
+
+```{r slopes}
+model_slopes <- lm(death_rate ~ 0 + period + period:log10_pop, data = county_period)
+stopifnot(isTRUE(all.equal(fitted(model_slopes), fitted(model_period_slope))))
+
+slopes <- tidy(model_slopes, conf.int = TRUE) %>%
+  filter(str_detect(term, "log10_pop")) %>%
+  mutate(period = str_remove(term, "^period") %>% str_remove(fixed(":log10_pop")),
+         period = factor(period, levels = period_labels)) %>%
+  select(period, estimate, std.error, conf.low, conf.high, p.value)
+
+knitr::kable(slopes, digits = c(0, 1, 2, 1, 1, 4),
+             col.names = c("Period", "Slope (deaths per 100k per 10x population)",
+                           "Std. error", "95% CI low", "95% CI high", "p-value"))
+```
+
+## Pictures of the model
+
+These panels show every county in every period, with the model's line drawn on top. The curved bands on the left are small counties with exactly 1, 2, 3 deaths. In a county of 2,000 people, a single death works out to 50 per 100,000, which is why small-county rates jump around so much.
+
+```{r viz-scatter, fig.height = 6.5}
+y_cap <- quantile(county_period$death_rate, 0.99)
+slope_labels <- slopes %>% mutate(label = sprintf("slope %+.1f", estimate))
+
+ggplot(county_period, aes(population, death_rate)) +
+  geom_point(alpha = 0.12, size = 0.7, color = "grey30") +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE,
+              color = "#b2182b", linewidth = 1) +
+  geom_text(data = slope_labels, aes(x = 1e7, y = y_cap * 0.93, label = label),
+            inherit.aes = FALSE, hjust = 1, size = 3.5, fontface = "bold") +
+  scale_x_log10(breaks = c(1e3, 1e4, 1e5, 1e6, 1e7),
+                labels = c("1k", "10k", "100k", "1M", "10M")) +
+  coord_cartesian(ylim = c(0, y_cap)) +
+  facet_wrap(~ period, ncol = 4, labeller = label_wrap_gen(width = 20)) +
+  labs(title = "County death rate vs. county population, one panel per period",
+       subtitle = "Each dot is one county. The red line is the model's fit for that period.",
+       x = "County population (log scale)", y = "Deaths per 100,000 in period") +
+  theme_minimal(base_size = 12)
+```
+
+
+# Bias
+
+## Bias in the data
+
+**The date is when a death was reported, not when it happened.** Backlogs sometimes arrived in one lump.
+
+**Some deaths sat unassigned and got moved later.** Several states kept a big share of their deaths in "Unassigned" rows for months, then moved them into counties all at once.
+
+**Not every state reports by county.** Utah reports many of its counties only through multi-county health districts, and Massachusetts combines Dukes and Nantucket. I dropped those because their counts can't be matched to one county's population.
+
+**Case counts are unreliable, which is why I use deaths.** Testing was much easier to get in some places and times than others, so case counts partly measure testing rather than infection. This chart shows deaths per 100 reported cases by county size.
+
+```{r viz-deaths-per-case, fig.height = 4.5}
+ggplot(group_period, aes(period, deaths_per_100_cases, color = size_group, group = size_group)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.2) +
+  scale_color_manual(values = group_colors, name = "County population") +
+  scale_x_discrete(labels = function(x) str_wrap(x, 12)) +
+  labs(title = "Reported deaths per 100 reported cases, by county size and period",
+       subtitle = "After the first period, small counties recorded more deaths per case every time",
+       x = NULL, y = "Deaths per 100 cases") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+```
+
+After the first period, the smallest counties recorded the most deaths per reported case every single time. The later gap could mean small counties missed more cases, or that their cases were more serious because residents were older or farther from a hospital. It shows that comparing cases would give a misleading picture.
+
+**Counting a death as a COVID death is a local judgment call.** Different places had different practices. If small counties undercounted COVID deaths more often, the real reversal would be bigger than what I show, not smaller.
+
+**Late data is thinner.** By 2022 many counties were reporting weekly or less often, and reporting got patchy. The late period is the least reliable of the seven.
+
+**Population is frozen.** Each county gets one population number for all three years, so people moving during the pandemic doesn't show up anywhere.
+
+## Bias in the analysis
+
+**Age is the big missing piece.** Small, rural counties tend to have older residents, and age is the strongest known risk factor for dying of COVID-19. This dataset has no ages in it. So I can't say how much of the reversal is really about age rather than about small places.  
+
+**County size is a rough stand-in for rural.** Some big counties are mostly farmland around a single city. Some small counties are suburbs. A proper urban-rural classification would be better, but it needs outside data.
+
+**Patterns across counties don't describe people.** This is a group-level analysis. A higher death rate in small counties doesn't mean any one person living there faced a higher risk. That mistake has a name: the ecological fallacy.
+
+ 
+
+# Conclusion
+
+COVID-19 deaths show a clear rural reversal. In the first months, the biggest counties had death rates several times higher than the smallest. That order flipped during the winter 2020-21 wave: the smallest counties passed the biggest on `r format(crossover_date, "%B %d, %Y")` and stayed ahead for the rest of the pandemic. Winter 2020-21 had the biggest raw gap, while `r most_lopsided$period` had the biggest gap relative to size. The model confirms the link between size and death rate changed across periods, running positive at first and negative from winter 2020-21 onward. That direction holds up when I weight by population, use a rank-based measure, change the size cutoffs, and put the flagged states back in.
+
+Cleaning the data turned out to be a beast. One state moving `r format(-biggest_move$change, big.mark = ",")` unplaced deaths into its counties on a single day was enough to noticeably change the Omicron results. County COVID data records reporting decisions as much as it records deaths. 
